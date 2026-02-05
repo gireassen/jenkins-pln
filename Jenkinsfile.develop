@@ -1,0 +1,90 @@
+@Library('acme-lib@main') _
+
+pipeline {
+  agent {
+    kubernetes {
+      label 'label'
+      yaml pipelineAgent(
+        kanikoImage: 'gcr.io/kaniko-project/executor:debug',
+        trivyImage: 'aquasec/trivy:latest',
+        craneImage: 'gcr.io/go-containerregistry/crane:debug',
+        serviceAccount: 'jenkins'
+        )
+    }
+  }
+
+  options {
+    timeout(time: 20, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    timestamps()
+  }
+
+  environment {
+    REGISTRY = "nexus.home.arpa"
+    IMAGE_REPO = "common"
+    TG_TOKEN_CRED = "tg-bot-token"
+    TG_CHATID_CRED = "tg-chat-id"
+    FAIL_REASON = ""
+  }
+
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+
+    stage('Init tags') {
+      steps {
+        script {
+          def sha = sh(script: "git rev-parse --short=12 HEAD", returnStdout: true).trim()
+          env.TAG = "dev-${sha}"
+          def repoName = getRepoName()
+          env.IMAGE = "${env.REGISTRY}/${env.IMAGE_REPO}/${repoName}:${env.TAG}"
+
+          if (!env.IMAGE || env.IMAGE.contains('null')) {
+            error("Bad IMAGE='${env.IMAGE}' (check REGISTRY/IMAGE_REPO)")
+          }
+          echo "IMAGE=${env.IMAGE}"
+        }
+      }
+    }
+    stage('Build to tar (no push)') { //IMAGE WORKSPACE
+      steps {
+        dockerBuild(image: env.IMAGE) 
+      }
+    }
+
+    stage('Scan tar (Trivy)') {
+      steps {
+        script {
+          try {
+            trivyAgent()
+            } catch (e) {
+            env.FAIL_REASON = "VULNS_FOUND (HIGH/CRITICAL)"
+            throw e
+          }
+        }
+      }
+    }
+
+    stage('Push tar to Nexus (crane)') {
+      steps {
+        craneAgent(image: env.IMAGE) 
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        def msg = "SUCCESS ✅: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nIMAGE: ${env.IMAGE}\nURL: ${env.BUILD_URL}"
+        notifyTelegram(tokenCred: env.TG_TOKEN_CRED, chatIdCred: env.TG_CHATID_CRED, text: msg)
+      }
+    }
+    failure {
+      script {
+        def reason = env.FAIL_REASON?.trim()
+        if (!reason) { reason = "BUILD_FAILED" }
+        def msg = "FAILURE 🚫: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nREASON: ${reason}\nURL: ${env.BUILD_URL}"
+        notifyTelegram(tokenCred: env.TG_TOKEN_CRED, chatIdCred: env.TG_CHATID_CRED, text: msg)
+      }
+    }
+  }
+}

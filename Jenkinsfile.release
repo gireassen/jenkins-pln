@@ -1,0 +1,136 @@
+@Library('acme-lib@main') _
+
+pipeline {
+  agent {
+    kubernetes {
+      label 'jenkins-jenkins-agent'
+      yaml pipelineAgent(
+        kubectlImage: 'bitnami/kubectl:latest',
+        craneImage:   'gcr.io/go-containerregistry/crane:debug',
+        trivyImage:   'aquasec/trivy:0.50.2',
+        kanikoImage:  'gcr.io/kaniko-project/executor:debug',
+        serviceAccount: 'jenkins'
+      )
+    }
+  }
+
+  options { timeout(time: 30, unit: 'MINUTES') }
+
+  environment {
+    REGISTRY   = "nexus.home.arpa"
+    IMAGE_REPO = "common"
+    NS         = "api-release"
+    DEPLOY     = "app"
+    CONTAINER  = "app"
+  }
+
+  stages {
+    stage('Guard: tag only') {
+      steps {
+        script {
+          if (!env.TAG_NAME?.trim()) { currentBuild.result = 'NOT_BUILT'; error("run on tag only") }
+        }
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Retag dev->release') {
+      steps {
+        script {
+          def sha = sh(script: "git rev-parse --short=12 HEAD", returnStdout: true).trim()
+          def repoName = getRepoName()
+
+          env.SRC = "${env.REGISTRY}/${env.IMAGE_REPO}/${repoName}:dev-${sha}"
+          env.DST = "${env.REGISTRY}/${env.IMAGE_REPO}/${repoName}:${env.TAG_NAME}"
+        }
+
+        container('crane') {
+          sh '''
+            set -euxo pipefail
+            crane cp --insecure "${SRC}" "${DST}"
+          '''
+        }
+      }
+    }
+
+    stage('Deploy') {
+      steps {
+        container('kubectl') {
+          sh '''
+            set -euxo pipefail
+
+            cat <<'YAML' > /tmp/app.yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: __DEPLOY__
+      labels:
+        app: __DEPLOY__
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: __DEPLOY__
+      template:
+        metadata:
+          labels:
+            app: __DEPLOY__
+        spec:
+          containers:
+            - name: __CONTAINER__
+              image: __IMAGE__
+              imagePullPolicy: IfNotPresent
+              ports:
+                - containerPort: 8080
+    YAML
+
+            # Подстановка значений
+            sed -i \
+              -e "s|__DEPLOY__|${DEPLOY}|g" \
+              -e "s|__CONTAINER__|${CONTAINER}|g" \
+              -e "s|__IMAGE__|${DST}|g" \
+              /tmp/app.yaml
+
+            echo "=== manifest ==="
+            cat /tmp/app.yaml
+
+            kubectl --request-timeout=15s -n "${NS}" apply -f /tmp/app.yaml
+            kubectl --request-timeout=15s -n "${NS}" rollout status deployment/"${DEPLOY}" --timeout=180s
+          '''
+        }
+      }
+    }
+
+
+    stage('Healthcheck (retries)') {
+      steps {
+        container('kubectl') {
+          sh '''
+            set -euo pipefail
+
+            # ждём появления availableReplicas (до ~2 минут)
+            for i in $(seq 1 12); do
+              avail="$(kubectl -n "${NS}" get deploy "${DEPLOY}" -o jsonpath="{.status.availableReplicas}" 2>/dev/null || true)"
+              if echo "${avail}" | grep -Eq '^[1-9][0-9]*$'; then
+                echo "OK: availableReplicas=${avail}"
+                exit 0
+              fi
+              echo "waiting... (${i}/12) availableReplicas='${avail}'"
+              sleep 10
+            done
+
+            echo "FAILED: availableReplicas is still not >= 1"
+            kubectl -n "${NS}" get deploy "${DEPLOY}" -o wide || true
+            kubectl -n "${NS}" describe deploy "${DEPLOY}" || true
+            exit 1
+          '''
+        }
+      }
+    }
+  }
+}
