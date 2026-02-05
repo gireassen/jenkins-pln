@@ -1,17 +1,7 @@
 @Library('acme-lib@main') _
 
 pipeline {
-  agent {
-    kubernetes {
-      label 'label'
-      yaml pipelineAgent(
-        kanikoImage: 'gcr.io/kaniko-project/executor:debug',
-        trivyImage: 'aquasec/trivy:latest',
-        craneImage: 'gcr.io/go-containerregistry/crane:debug',
-        serviceAccount: 'jenkins'
-        )
-    }
-  }
+  agent { label 'label' }
 
   options {
     timeout(time: 20, unit: 'MINUTES')
@@ -22,8 +12,8 @@ pipeline {
   environment {
     REGISTRY = "nexus.home.arpa"
     IMAGE_REPO = "common"
-    TG_TOKEN_CRED = "tg-bot-token"
-    TG_CHATID_CRED = "tg-chat-id"
+    TG_TOKEN_CRED = "TG_TOKEN_CRED"
+    TG_CHATID_CRED = "TG_CHATID_CRED"
     FAIL_REASON = ""
   }
 
@@ -45,9 +35,10 @@ pipeline {
         }
       }
     }
-    stage('Build to tar (no push)') { //IMAGE WORKSPACE
+
+    stage('Build to tar (no push)') { // IMAGE WORKSPACE
       steps {
-        dockerBuild(image: env.IMAGE) 
+        dockerBuild(image: env.IMAGE)
       }
     }
 
@@ -56,7 +47,7 @@ pipeline {
         script {
           try {
             trivyAgent()
-            } catch (e) {
+          } catch (e) {
             env.FAIL_REASON = "VULNS_FOUND (HIGH/CRITICAL)"
             throw e
           }
@@ -66,7 +57,7 @@ pipeline {
 
     stage('Push tar to Nexus (crane)') {
       steps {
-        craneAgent(image: env.IMAGE) 
+        echo "DRY RUN: skipping push to Nexus. Would push: ${env.IMAGE}"
       }
     }
   }
