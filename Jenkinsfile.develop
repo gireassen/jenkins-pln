@@ -1,5 +1,3 @@
-@Library('acme-lib@main') _
-
 pipeline {
   agent { label 'label' }
 
@@ -10,43 +8,45 @@ pipeline {
   }
 
   environment {
-    REGISTRY = "nexus.home.arpa"
-    IMAGE_REPO = "common"
-    TG_TOKEN_CRED = "TG_TOKEN_CRED"
-    TG_CHATID_CRED = "TG_CHATID_CRED"
+    TG_TOKEN_CRED = "tg-bot-token"
+    TG_CHATID_CRED = "tg-chat-id"
     FAIL_REASON = ""
+    IMAGE_NAME = "api-dotnet"
   }
 
   stages {
     stage('Checkout') { steps { checkout scm } }
 
-    stage('Init tags') {
+    stage('Init tag') {
       steps {
         script {
           def sha = sh(script: "git rev-parse --short=12 HEAD", returnStdout: true).trim()
           env.TAG = "dev-${sha}"
-          def repoName = getRepoName()
-          env.IMAGE = "${env.REGISTRY}/${env.IMAGE_REPO}/${repoName}:${env.TAG}"
-
-          if (!env.IMAGE || env.IMAGE.contains('null')) {
-            error("Bad IMAGE='${env.IMAGE}' (check REGISTRY/IMAGE_REPO)")
-          }
+          env.IMAGE = "${env.IMAGE_NAME}:${env.TAG}"
+          writeFile(file: "image.info", text: "${env.IMAGE}\n")
           echo "IMAGE=${env.IMAGE}"
         }
       }
     }
 
-    stage('Build to tar (no push)') { // IMAGE WORKSPACE
+    stage('Build image') {
       steps {
-        dockerBuild(image: env.IMAGE)
+        sh "docker build -t ${env.IMAGE} ."
       }
     }
 
-    stage('Scan tar (Trivy)') {
+    stage('Scan image (Trivy)') {
       steps {
         script {
           try {
-            trivyAgent()
+            sh """
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:latest image \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 1 \
+                  ${env.IMAGE}
+            """
           } catch (e) {
             env.FAIL_REASON = "VULNS_FOUND (HIGH/CRITICAL)"
             throw e
@@ -55,9 +55,16 @@ pipeline {
       }
     }
 
-    stage('Push tar to Nexus (crane)') {
+    stage('Save image to artifact (tar.gz)') {
       steps {
-        echo "DRY RUN: skipping push to Nexus. Would push: ${env.IMAGE}"
+        sh "docker save ${env.IMAGE} | gzip -c > image.tar.gz"
+        archiveArtifacts artifacts: "image.tar.gz,image.info", fingerprint: true
+      }
+    }
+
+    stage('Push to Nexus (dry-run)') {
+      steps {
+        echo "DRY RUN: would push ${env.IMAGE} to registry (skipped by requirement)"
       }
     }
   }
@@ -65,17 +72,28 @@ pipeline {
   post {
     success {
       script {
-        def msg = "SUCCESS ✅: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nIMAGE: ${env.IMAGE}\nURL: ${env.BUILD_URL}"
-        notifyTelegram(tokenCred: env.TG_TOKEN_CRED, chatIdCred: env.TG_CHATID_CRED, text: msg)
+        notifyTG("SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nIMAGE: ${env.IMAGE}\\n${env.BUILD_URL}")
       }
     }
     failure {
       script {
         def reason = env.FAIL_REASON?.trim()
-        if (!reason) { reason = "BUILD_FAILED" }
-        def msg = "FAILURE 🚫: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nREASON: ${reason}\nURL: ${env.BUILD_URL}"
-        notifyTelegram(tokenCred: env.TG_TOKEN_CRED, chatIdCred: env.TG_CHATID_CRED, text: msg)
+        if (!reason) reason = "BUILD_FAILED"
+        notifyTG("FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER}\\nREASON: ${reason}\\n${env.BUILD_URL}")
       }
     }
+  }
+}
+
+def notifyTG(String text) {
+  withCredentials([
+    string(credentialsId: env.TG_TOKEN_CRED, variable: 'TG_TOKEN'),
+    string(credentialsId: env.TG_CHATID_CRED, variable: 'TG_CHAT')
+  ]) {
+    sh """
+      curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+        -d "chat_id=${TG_CHAT}" \
+        --data-urlencode "text=${text}" >/dev/null
+    """
   }
 }
